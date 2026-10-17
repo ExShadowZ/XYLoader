@@ -1,232 +1,260 @@
 # STM32H7B0 Bootloader
 
-Custom bootloader for **STM32H7B0VBTx** with A/B firmware update over SD card,
-QSPI flash storage, EEPROM metadata, and an on-screen terminal (LCD).
+A custom bootloader for the STM32H7B0VBTx. It updates firmware from an SD card,
+keeps two copies of the firmware in external QSPI flash, stores metadata in
+EEPROM, and shows progress on an onboard LCD.
 
-The bootloader always boots from **partition A**, keeps **partition B** as a
-rollback backup, and restores A from B automatically after repeated boot failures.
+The bootloader always starts from partition A. Partition B is a rollback
+snapshot used to recover when a new firmware fails to boot several times in a row.
 
 ---
 
-## Features
+## What it does
 
-- **A/B firmware partitioning** in external QSPI flash (W25Q64, 8 MB)
-- **SD card firmware update** (`UPDATE/UPD.BIN`) with FATFS
-- **CRC32 integrity check** of the update image (STM32 hardware CRC)
-- **Version comparison** — only newer firmware is installed
-- **Automatic backup** of A → B before writing a new image to A
-- **Automatic restore** B → A after 3 failed boot attempts
-- **EEPROM metadata** (AT24C04 over I2C): magic, version, CRC,
-  update counter, boot attempts, restore flag
-- **On-screen terminal** (ST7735 LCD, 80×160) with colored log levels
-- **Error logging** to SD card (`LOG/LOG.TXT`) on fatal errors
-- **Safe boot chain**: memory-mapped QSPI → jump to application at `0x90000000`
+Firmware update from an SD card via the file UPDATE/UPD.BIN using FATFS.
+
+Integrity check of the update image via CRC32 on the STM32 hardware CRC unit.
+
+Version comparison — only a newer firmware is installed.
+
+Automatic backup of partition A into partition B before writing a new image,
+so a rollback point always exists.
+
+Automatic restore of partition A from partition B after three failed boot
+attempts.
+
+Metadata stored in EEPROM AT24C04 over I2C: magic value, version, CRC, update
+counter, boot attempt counter, restore flag.
+
+Log output on the ST7735 LCD (80×160) with color-coded severity levels.
+
+Fatal errors are written to LOG/LOG.TXT on the SD card.
+
+Jump to the application through QSPI memory-mapped mode at address 0x90000000.
 
 ---
 
 ## Hardware
 
-| Peripheral | Interface | Details                             |
-|------------|-----------|-------------------------------------|
-| MCU        | —         | STM32H7B0VBTx (Cortex-M7)           |
-| LCD        | SPI4      | ST7735, 0.96" 80×160, backlight PWM |
-| SD card    | SDMMC1    | 4-bit, FATFS                        |
-| QSPI flash | OCTOSPI1  | W25Q64 (8 MB), memory-mapped        |
-| EEPROM     | I2C1      | AT24C04 (512 B)                     |
-| LED        | PE3       | Status / error indication           |
-| Key        | PC13      | (reserved)                          |
+Microcontroller STM32H7B0VBTx on a Cortex-M7 core.
+
+LCD ST7735, 0.96 inch, 80×160 resolution, connected over SPI4, backlight
+controlled by PWM on TIM1.
+
+SD card connected over SDMMC1 in four-bit mode, with FATFS on top.
+
+External QSPI flash W25Q64, 8 MB, connected over OCTOSPI1 and used in
+memory-mapped mode.
+
+EEPROM AT24C04, 512 bytes, connected over I2C1.
+
+LED on pin PE3 used for status and error indication.
+
+Button on pin PC13 reserved for future use.
 
 ---
 
 ## Memory layout
 
-### QSPI flash (8 MB)
-0x90000000 ┌─────────────────────────┐
-│ Partition A (4 MB) │ ← active firmware (always booted)
-0x90400000 ├─────────────────────────┤
-│ Partition B (4 MB) │ ← backup / rollback copy
-0x90800000 └─────────────────────────┘
+The external QSPI flash, 8 MB total, is split in half. The first half starting
+at address 0x90000000 is partition A, which holds the active firmware and is
+always the one booted. The second half starting at address 0x90400000 is
+partition B, used as a rollback backup.
 
+EEPROM stores metadata for both partitions at fixed addresses. For each
+partition it holds the magic value, three version components (major, minor,
+patch), and the firmware CRC. Separately it stores the update counter, the
+failed boot attempt counter, and the restore flag.
 
-### EEPROM (AT24C04)
-
-| Address | Size | Field                  |
-|---------|------|------------------------|
-| 0x00    | 4    | Magic (partition A)    |
-| 0x10    | 1    | Version major (A)      |
-| 0x20    | 1    | Version minor (A)      |
-| 0x30    | 1    | Version patch (A)      |
-| 0x40    | 4    | Firmware CRC (A)       |
-| 0x50    | 4    | Magic (partition B)    |
-| 0x60    | 1    | Version major (B)      |
-| 0x70    | 1    | Version minor (B)      |
-| 0x80    | 1    | Version patch (B)      |
-| 0x90    | 4    | Firmware CRC (B)       |
-| 0xA0    | 4    | Update counter         |
-| 0xB0    | 1    | Boot attempts          |
-| 0xC0    | 1    | Restore flag           |
-
-`Magic = 0x43EAB508`
+The magic value is 0x43EAB508 and is used to verify that EEPROM metadata has
+been initialized correctly.
 
 ---
 
-## Update image format (`UPDATE/UPD.BIN`)
+## Update file format
 
-The image is a raw firmware blob followed by a fixed footer:
+The file UPDATE/UPD.BIN consists of the firmware body followed by a fixed
+footer. The footer contains the magic value, three version components, one
+reserved byte, and a CRC32 computed over the firmware body without the footer.
 
-```c
-typedef struct {
-    uint32_t magic;      // 0x43EAB508
-    uint8_t  major;
-    uint8_t  minor;
-    uint8_t  patch;
-    uint8_t  reserved;
-    uint32_t crc;        // CRC32 of the firmware body (excluding footer)
-} FirmwareFooter_t;
+That CRC is compared against the CRC computed over the file during reading,
+and the same value is written to EEPROM after a successful install.
 
 ---
 
-## Boot flow
+## Boot sequence
 
-Reset
-  │
-  ▼
-Init: LCD → SD → QSPI → EEPROM
-  │
-  ▼
-Restore flag set?
-  ├─ yes → copy B → A, clear flag, reset
-  └─ no
-  │
-  ▼
-UPD.BIN present on SD?
-  ├─ no  → JumpToApplication(A)
-  └─ yes
-       │
-       ▼
-     Read footer, check magic
-       │
-       ▼
-     Version > current A?
-       ├─ no  → JumpToApplication(A)
-       └─ yes
-            │
-            ▼
-          CRC matches footer?
-            ├─ no  → abort, JumpToApplication(A)
-            └─ yes
-                 │
-                 ▼
-               Backup A → B
-                 │
-                 ▼
-               Erase A
-                 │
-                 ▼
-               Write new image to A
-                 │
-                 ▼
-               Update EEPROM A metadata, bump update counter
-                 │
-                 ▼
-               Delete UPD.BIN
-                 │
-                 ▼
-               Reset → boot new A
+After reset the bootloader initializes the LCD, the SD card, the QSPI flash,
+and the EEPROM.
 
-Boot failure recovery
-JumpToApplication() validates the reset vector at 0x90000004. If invalid:
+It then checks the restore flag in EEPROM. If the flag is set, the bootloader
+copies partition B into partition A, clears the flag, and reboots so the
+restored firmware starts.
 
-Increment boot-attempt counter in EEPROM.
+If the flag is not set, the bootloader checks whether UPDATE/UPD.BIN exists on
+the SD card. If the file is missing, it jumps to the application from
+partition A.
 
-Reset and retry.
+If the file is present, the footer is read and the magic value is verified.
+On a bad magic value the update is aborted and the bootloader jumps to the
+application.
 
-After BOOT_ATTEMPTS_MAX (3) failures → set restore flag → reset.
+Next the versions are compared: if the file version is not higher than the
+current partition A version, the update is aborted and the bootloader jumps to
+the application.
 
-On next boot the restore flag triggers CopyPartitionBtoA() and reset again.
+Then the file CRC is computed and compared with the CRC from the footer. On a
+mismatch the update is aborted and the bootloader jumps to the application.
 
-A successful boot clears the boot-attempt counter.
+If all checks pass, the bootloader backs up partition A into partition B,
+erases partition A, writes the new image into it, updates partition A metadata
+in EEPROM, and increments the update counter.
 
-## Project structure
-
-├── Core/                   STM32CubeMX generated (main, MSP, IT, HAL config)
-├── Drivers/                CMSIS + STM32H7xx HAL
-├── Middlewares/            FATFS
-├── LCD/                    ST7735 driver
-├── EPROM/                  AT24Cxx EEPROM driver
-├── QSPI/                   OCTOSPI flash driver + firmware update logic
-├── SD/                     SD card / FATFS wrapper
-├── DTP/                    On-screen terminal (DTP_Print / DTP_PrintLine)
-├── LOG/                    Log macros + error code
-└── startup_stm32h7b0vbtx.s Startup / vector table
-
-Build
-Open the project in STM32CubeIDE (or import into your toolchain).
-
-Build the Debug or Release configuration.
-
-Flash the bootloader to internal flash (0x08000000).
-
-The bootloader itself is a normal .elf — flash it with ST-LINK / CubeProgrammer.
-
-Flashing a new firmware (end-user)
-Format an SD card as FAT32.
-
-Create folder UPDATE/ and copy your firmware as UPDATE/UPD.BIN
-(built with FirmwareFooter_t appended and CRC computed over the body).
-
-Insert SD, reset the board.
-
-Watch the LCD: UPDATE → Backup A → B → Write A → DONE.
-
-Board reboots into the new firmware.
-
-UPD.BIN is deleted from the SD automatically.
-
-If the new firmware fails to boot 3 times, the bootloader restores A from B
-and reboots into the previous working firmware.
-
-Log levels (on LCD)
-Macro	Color	Usage
-PROGRAMM_LOG_INFO(...)	White	Informational messages
-PROGRAMM_LOG_OK(...)	Green	Success
-PROGRAMM_LOG_WARNING(...)	Yellow	Warnings / progress
-PROGRAMM_LOG_ERROR(...)	Red	Errors
-PROGRAMM_LOG_PROGRESS(...)	Cyan	Progress (%, sectors, MB)
-Disable all logging by commenting out #define PROGRAMM_DEBUG in LOG/LOG.h.
-
-Error codes
-ErrorCode (global in LOG.c) is set before each Error_Handler() call
-and printed on the LCD + written to LOG/LOG.TXT on the SD card.
-
-Code	Meaning
-1	RCC oscillator config failed
-2	RCC clock config failed
-3	CRC init failed
-4–6	I2C init / analog / digital filter
-7	OCTOSPI init failed
-8	OCTOSPI manager config failed
-9	SDMMC init failed
-10	SPI4 init failed
-11–13	TIM1 PWM init failed
-14	TIM1 break/dead-time config failed
-15	EEPROM not responding
-16	Unexpected fallthrough after jump
-17–19	QSPI memory-mapped setup failed
-20	Jump to app returned (should not happen)
-21	Update_CheckAndStart returned non-zero
-Notes
-The bootloader always boots partition A. Partition B is a rollback
-snapshot, not a second boot target.
-
-Memory-mapped QSPI requires the MPU region for 0x90000000 to be
-cacheable; the application must invalidate D-cache after flashing.
-
-EEPROM writes are page-aligned via EEPROM_ClearPage before each field
-update to avoid stale bits.
-
-License
-Internal / private project. All rights reserved.
-
+After that the file UPDATE/UPD.BIN is deleted from the SD card and the system
+reboots so it starts from the new firmware.
 
 ---
+
+## Recovery after a failed boot
+
+Before jumping to the application the bootloader validates the reset vector at
+address 0x90000004. If the address is outside the allowed range, the attempt
+is considered a failure.
+
+On failure the boot attempt counter in EEPROM is incremented and the system
+reboots. This repeats up to three times. If the application still has not
+started after three attempts, the bootloader sets the restore flag and reboots.
+On the next boot the restore flag triggers a copy of partition B into
+partition A, followed by another reboot.
+
+On a successful boot the attempt counter is cleared.
+
+---
+
+## Project layout
+
+The Core folder contains files generated by STM32CubeMX: main, MSP, interrupt
+handlers, and HAL configuration.
+
+The Drivers folder contains CMSIS and the STM32H7xx HAL.
+
+The Middlewares folder contains FATFS.
+
+The LCD folder contains the ST7735 driver.
+
+The EPROM folder contains the AT24Cxx EEPROM driver.
+
+The QSPI folder contains the OCTOSPI driver and the firmware update logic.
+
+The SD folder contains the wrapper over the SD card and FATFS.
+
+The DTP folder contains the on-screen terminal with the DTP_Print and
+DTP_PrintLine functions.
+
+The LOG folder contains logging macros and the global ErrorCode variable.
+
+The startup_stm32h7b0vbtx.s file in the root holds the vector table and
+startup code.
+
+---
+
+## Build
+
+Open the project in STM32CubeIDE or import it into any other environment that
+supports STM32H7. Build either the Debug or the Release configuration. The
+resulting elf file of the bootloader is flashed into the internal flash of the
+microcontroller at address 0x08000000 using ST-LINK or CubeProgrammer.
+
+---
+
+## Flashing new firmware
+
+Format an SD card as FAT32. Create a folder named UPDATE in the root and place
+the file UPD.BIN into it, built with the footer appended and a correct CRC
+over the firmware body. Insert the card into the device and press reset.
+
+The LCD shows the sequence of steps: detecting the update, backing up
+partition A into partition B, writing the new image into partition A, and
+finishing. The device then reboots and starts from the new firmware, and the
+file UPD.BIN is removed from the SD card automatically.
+
+If the new firmware fails to start three times in a row, the bootloader
+restores partition A from partition B and reboots into the previous working
+firmware.
+
+---
+
+## Log levels
+
+Informational messages are printed in white.
+
+Successful operations are printed in green.
+
+Warnings and progress are printed in yellow.
+
+Errors are printed in red.
+
+Progress details such as percentages, sectors, and megabytes are printed in
+cyan.
+
+Logging is disabled by commenting out the PROGRAMM_DEBUG line in LOG/LOG.h.
+
+---
+
+## Error codes
+
+The global ErrorCode variable is declared in LOG.c. It is set before each call
+to Error_Handler, printed on the LCD, and appended to LOG/LOG.TXT on the SD
+card.
+
+Code 1 means an RCC oscillator configuration failure.
+
+Code 2 means an RCC clock configuration failure.
+
+Code 3 means a CRC module initialization failure.
+
+Codes 4 through 6 mean I2C, analog filter, and digital filter initialization
+failures.
+
+Code 7 means an OCTOSPI initialization failure.
+
+Code 8 means an OCTOSPI manager configuration failure.
+
+Code 9 means an SDMMC initialization failure.
+
+Code 10 means an SPI4 initialization failure.
+
+Codes 11 through 13 mean PWM initialization failures on TIM1.
+
+Code 14 means a break and dead-time configuration failure on TIM1.
+
+Code 15 means the EEPROM is not responding.
+
+Code 16 means unexpected continuation after the jump to the application.
+
+Codes 17 through 19 mean QSPI memory-mapped setup failures.
+
+Code 20 means control returned from the application, which should never
+happen.
+
+Code 21 means Update_CheckAndStart returned a non-zero result.
+
+---
+
+## Additional notes
+
+The bootloader always starts from partition A. Partition B is a snapshot for
+rollbacks, not a second boot target.
+
+QSPI memory-mapped mode requires the MPU region for address 0x90000000 to be
+marked as cacheable. The application must invalidate the D-cache itself if
+needed after programming the QSPI flash.
+
+EEPROM writes are page-aligned: before each field update the page is cleared
+to avoid accumulating stale bits.
+
+---
+
+## License
+
+Internal and private project. All rights reserved.
